@@ -254,6 +254,17 @@ class TestBotWebsocketClient(unittest.TestCase):
             # Should log warning
             mock_logger.warning.assert_called_once()
 
+    def test_send_async_calls_drop_callback_when_not_connected(self):
+        """Test that dropped messages call the drop callback with connection state."""
+        callback = Mock()
+        self.client.on_drop_callback = callback
+        self.client.connection_state = BotWebsocketClient.NOT_STARTED
+        test_message = {"type": "test", "data": "hello"}
+
+        self.client.send_async(test_message)
+
+        callback.assert_called_once_with(test_message, BotWebsocketClient.NOT_STARTED)
+
     def test_send_loop(self):
         """Test the send loop functionality."""
         mock_websocket = Mock()
@@ -280,6 +291,25 @@ class TestBotWebsocketClient(unittest.TestCase):
         expected_calls = [call(json.dumps(msg)) for msg in test_messages]
         mock_websocket.send.assert_has_calls(expected_calls)
 
+    def test_send_loop_calls_send_success_callback_after_successful_send(self):
+        """Test that the send success callback is called after websocket send succeeds."""
+        callback = Mock()
+        self.client.on_send_success_callback = callback
+        mock_websocket = Mock()
+        self.client.websocket = mock_websocket
+        self.client.connection_state = BotWebsocketClient.CONNECTED
+        test_message = {"type": "test", "data": "hello"}
+        self.client.send_queue.put(test_message)
+
+        def side_effect(*args):
+            self.client.connection_state = BotWebsocketClient.STOPPED
+
+        mock_websocket.send.side_effect = side_effect
+
+        self.client.send_loop()
+
+        callback.assert_called_once_with(test_message)
+
     def test_send_loop_handles_send_error(self):
         """Test that send loop handles websocket send errors."""
         mock_websocket = Mock()
@@ -293,6 +323,23 @@ class TestBotWebsocketClient(unittest.TestCase):
         with patch.object(self.client, "_trigger_reconnect") as mock_reconnect:
             self.client.send_loop()
             mock_reconnect.assert_called_once()
+
+    def test_send_loop_calls_send_failure_callback_on_send_error(self):
+        """Test that websocket send failures call the send failure callback."""
+        callback = Mock()
+        self.client.on_send_failure_callback = callback
+        mock_websocket = Mock()
+        exception = ConnectionError("Send failed")
+        mock_websocket.send.side_effect = exception
+        self.client.websocket = mock_websocket
+        self.client.connection_state = BotWebsocketClient.CONNECTED
+        test_message = {"type": "test"}
+        self.client.send_queue.put(test_message)
+
+        with patch.object(self.client, "_trigger_reconnect"):
+            self.client.send_loop()
+
+        callback.assert_called_once_with(test_message, exception)
 
     # --------------------------------------------------------------------- #
     #  Message receiving tests                                              #

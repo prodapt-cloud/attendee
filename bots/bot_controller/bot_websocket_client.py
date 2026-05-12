@@ -25,8 +25,18 @@ class BotWebsocketClient:
     FAILED = "FAILED"
     STOPPED = "STOPPED"
 
-    def __init__(self, url: str, on_message_callback: Callable[[dict], None]):
+    def __init__(
+        self,
+        url: str,
+        on_message_callback: Callable[[dict], None],
+        on_send_success_callback: Callable[[dict], None] | None = None,
+        on_send_failure_callback: Callable[[dict, Exception], None] | None = None,
+        on_drop_callback: Callable[[dict, str], None] | None = None,
+    ):
         self.on_message_callback = on_message_callback
+        self.on_send_success_callback = on_send_success_callback
+        self.on_send_failure_callback = on_send_failure_callback
+        self.on_drop_callback = on_drop_callback
         self.websocket_url = url
         self.websocket = None
 
@@ -66,6 +76,11 @@ class BotWebsocketClient:
         if self.connection_state == self.CONNECTED:
             self.send_queue.put(message)
         else:
+            if self.on_drop_callback:
+                try:
+                    self.on_drop_callback(message, self.connection_state)
+                except Exception as e:
+                    logger.warning("BotWebsocketClient drop callback failed: %s", e)
             if self.dropped_message_ticker % 1000 == 0:
                 logger.warning("BotWebsocketClient is not connected, it is in state %s, dropping message", self.connection_state)
             self.dropped_message_ticker += 1
@@ -147,7 +162,17 @@ class BotWebsocketClient:
 
             try:
                 self.websocket.send(json.dumps(message))
+                if self.on_send_success_callback:
+                    try:
+                        self.on_send_success_callback(message)
+                    except Exception as e:
+                        logger.warning("BotWebsocketClient send success callback failed: %s", e)
             except Exception as e:
+                if self.on_send_failure_callback:
+                    try:
+                        self.on_send_failure_callback(message, e)
+                    except Exception as callback_exception:
+                        logger.warning("BotWebsocketClient send failure callback failed: %s", callback_exception)
                 logger.info("BotWebsocketClient send failed (%s). Leaving loop.", e)
                 break
 

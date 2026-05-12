@@ -152,12 +152,14 @@ class BotController:
         if not self.websocket_client_manager:
             return
 
+        sequence = self._next_per_participant_audio_sequence(speaker_id)
         payload = per_participant_audio_websocket_payload(
             participant_uuid=speaker_id,
             chunk=chunk_bytes,
             input_sample_rate=self.get_per_participant_audio_sample_rate(),
             output_sample_rate=self.bot_in_db.websocket_per_participant_audio_sample_rate(),
             bot_object_id=self.bot_in_db.object_id,
+            sequence=sequence,
         )
 
         self.websocket_client_manager.send_per_participant_audio(payload)
@@ -396,14 +398,26 @@ class BotController:
         if not self.websocket_client_manager:
             return
 
+        sequence = self._next_mixed_audio_sequence()
         payload = mixed_audio_websocket_payload(
             chunk=chunk,
             input_sample_rate=self.mixed_audio_sample_rate(),
             output_sample_rate=self.bot_in_db.websocket_audio_sample_rate(),
             bot_object_id=self.bot_in_db.object_id,
+            sequence=sequence,
         )
 
         self.websocket_client_manager.send_mixed_audio(payload)
+
+    def _next_mixed_audio_sequence(self):
+        self.mixed_audio_websocket_sequence += 1
+        return self.mixed_audio_websocket_sequence
+
+    def _next_per_participant_audio_sequence(self, participant_uuid):
+        participant_uuid = str(participant_uuid)
+        next_sequence = self.per_participant_audio_websocket_sequences.get(participant_uuid, 0) + 1
+        self.per_participant_audio_websocket_sequences[participant_uuid] = next_sequence
+        return next_sequence
 
     def is_using_rtms(self):
         return self.bot_in_db.zoom_rtms_stream_id is not None
@@ -684,6 +698,8 @@ class BotController:
         self.pubsub_channel = f"bot_{self.bot_in_db.id}"
 
         self.automatic_leave_configuration = AutomaticLeaveConfiguration(**self.bot_in_db.automatic_leave_settings())
+        self.mixed_audio_websocket_sequence = 0
+        self.per_participant_audio_websocket_sequences = {}
 
         self.per_participant_realtime_video_configuration = PerParticipantRealtimeVideoConfiguration(
             webcam_configuration=PerParticipantRealtimeVideoSourceConfiguration(resolution=self.bot_in_db.websocket_per_participant_video_webcam_resolution()),

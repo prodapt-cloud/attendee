@@ -32,38 +32,46 @@ def _downsample(chunk: bytes, src_rate: int, dst_rate: int) -> bytes:
     return converted
 
 
-def mixed_audio_websocket_payload(chunk: bytes, input_sample_rate: int, output_sample_rate: int, bot_object_id: str) -> dict:
+def mixed_audio_websocket_payload(chunk: bytes, input_sample_rate: int, output_sample_rate: int, bot_object_id: str, sequence: int | None = None) -> dict:
     """
     Down-sample (if needed) and package for websocket.
     """
     chunk_downsampled = _downsample(chunk, input_sample_rate, output_sample_rate)
+
+    data = {
+        "chunk": b64encode(chunk_downsampled).decode("ascii"),
+        "timestamp_ms": int(time.time() * 1000),
+        "sample_rate": output_sample_rate,
+    }
+    if sequence is not None:
+        data["sequence"] = sequence
 
     return {
         "trigger": RealtimeTriggerTypes.type_to_api_code(RealtimeTriggerTypes.MIXED_AUDIO_CHUNK),
         "bot_id": bot_object_id,
-        "data": {
-            "chunk": b64encode(chunk_downsampled).decode("ascii"),
-            "timestamp_ms": int(time.time() * 1000),
-            "sample_rate": output_sample_rate,
-        },
+        "data": data,
     }
 
 
-def per_participant_audio_websocket_payload(participant_uuid: str, chunk: bytes, input_sample_rate: int, output_sample_rate: int, bot_object_id: str) -> dict:
+def per_participant_audio_websocket_payload(participant_uuid: str, chunk: bytes, input_sample_rate: int, output_sample_rate: int, bot_object_id: str, sequence: int | None = None) -> dict:
     """
     Down-sample (if needed) and package for websocket.
     """
     chunk_downsampled = _downsample(chunk, input_sample_rate, output_sample_rate)
 
+    data = {
+        "participant_uuid": str(participant_uuid),
+        "chunk": b64encode(chunk_downsampled).decode("ascii"),
+        "timestamp_ms": int(time.time() * 1000),
+        "sample_rate": output_sample_rate,
+    }
+    if sequence is not None:
+        data["sequence"] = sequence
+
     return {
         "trigger": RealtimeTriggerTypes.type_to_api_code(RealtimeTriggerTypes.PER_PARTICIPANT_AUDIO_CHUNK),
         "bot_id": bot_object_id,
-        "data": {
-            "participant_uuid": str(participant_uuid),
-            "chunk": b64encode(chunk_downsampled).decode("ascii"),
-            "timestamp_ms": int(time.time() * 1000),
-            "sample_rate": output_sample_rate,
-        },
+        "data": data,
     }
 
 

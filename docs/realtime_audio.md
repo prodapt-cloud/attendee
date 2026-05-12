@@ -34,12 +34,13 @@ Your WebSocket server will receive messages in this format.
   "data": {
     "chunk": "UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAABACAAAGRLVEE...",
     "sample_rate": 16000,
-    "timestamp_ms": 1703123456789
+    "timestamp_ms": 1703123456789,
+    "sequence": 1
   }
 }
 ```
 
-The `chunk` field is base64-encoded 16-bit single channel PCM audio data at the frequency specified in the `sample_rate` field.
+The `chunk` field is base64-encoded 16-bit single channel PCM audio data at the frequency specified in the `sample_rate` field. The `sequence` field is a monotonic counter scoped to the bot's mixed audio websocket stream.
 
 ### Incoming Audio (Your Websocket Server → Attendee)
 
@@ -100,10 +101,13 @@ The websocket message payload is identical to the mixed audio payload, except th
     "participant_uuid": "participant_abc123",
     "chunk": "UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAABACAAAGRLVEE...",
     "sample_rate": 16000,
-    "timestamp_ms": 1703123456789
+    "timestamp_ms": 1703123456789,
+    "sequence": 1
   }
 }
 ```
+
+The `sequence` field is scoped independently for each `participant_uuid`.
 
  See [here](https://github.com/attendee-labs/realtime-per-participant-video-and-audio-example) for an example program showing how use per-participant audio streaming.
 
@@ -114,5 +118,4 @@ Attendee will automatically retry to connect to your websocket server if the con
 ## Error Messages
 
 Currently, we don't give any feedback on errors with the websocket connection or invalid message formats. We plan to improve this in the future.
-
 

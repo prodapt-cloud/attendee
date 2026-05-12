@@ -194,7 +194,12 @@ class TestBotWebsocketClientManager(unittest.TestCase):
             on_message_callback=cb,
         )
 
-        MockClient.assert_called_once_with(url=MIXED_URL, on_message_callback=cb)
+        MockClient.assert_called_once()
+        self.assertEqual(MockClient.call_args.kwargs["url"], MIXED_URL)
+        self.assertEqual(MockClient.call_args.kwargs["on_message_callback"], cb)
+        self.assertIsNotNone(MockClient.call_args.kwargs["on_send_success_callback"])
+        self.assertIsNotNone(MockClient.call_args.kwargs["on_send_failure_callback"])
+        self.assertIsNotNone(MockClient.call_args.kwargs["on_drop_callback"])
 
     def test_callback_forwarded_to_all_clients(self, MockClient):
         """Test that the same callback is forwarded when three distinct clients are created."""
@@ -209,6 +214,121 @@ class TestBotWebsocketClientManager(unittest.TestCase):
         self.assertEqual(MockClient.call_count, 3)
         for c in MockClient.call_args_list:
             self.assertEqual(c.kwargs["on_message_callback"], cb)
+            self.assertIsNotNone(c.kwargs["on_send_success_callback"])
+            self.assertIsNotNone(c.kwargs["on_send_failure_callback"])
+            self.assertIsNotNone(c.kwargs["on_drop_callback"])
+
+    def test_sent_audio_messages_metric_counts_mixed_audio(self, MockClient):
+        """Test that successful mixed audio sends increment the sender-side metric."""
+        mgr = BotWebsocketClientManager(
+            mixed_audio_url=MIXED_URL,
+            per_participant_audio_url=None,
+            per_participant_video_url=None,
+            on_message_callback=self.mock_callback,
+        )
+        message = {
+            "bot_id": "bot_123",
+            "trigger": "realtime_audio.mixed",
+            "data": {"sequence": 1},
+        }
+
+        with patch("bots.bot_controller.bot_websocket_client_manager.logger") as mock_logger:
+            mgr._on_message_sent(message)
+
+        self.assertEqual(mgr.sent_audio_messages_total("bot_123", "mixed"), 1)
+        self.assertIn("attendee_sent_audio_messages_total", mock_logger.info.call_args.args[0])
+
+    def test_sent_audio_messages_metric_counts_per_participant_audio(self, MockClient):
+        """Test that per-participant audio send counts are scoped by participant."""
+        mgr = BotWebsocketClientManager(
+            mixed_audio_url=None,
+            per_participant_audio_url=PER_PARTICIPANT_AUDIO_URL,
+            per_participant_video_url=None,
+            on_message_callback=self.mock_callback,
+        )
+
+        mgr._on_message_sent(
+            {
+                "bot_id": "bot_123",
+                "trigger": "realtime_audio.per_participant",
+                "data": {"participant_uuid": "participant_a", "sequence": 1},
+            }
+        )
+        mgr._on_message_sent(
+            {
+                "bot_id": "bot_123",
+                "trigger": "realtime_audio.per_participant",
+                "data": {"participant_uuid": "participant_a", "sequence": 2},
+            }
+        )
+        mgr._on_message_sent(
+            {
+                "bot_id": "bot_123",
+                "trigger": "realtime_audio.per_participant",
+                "data": {"participant_uuid": "participant_b", "sequence": 1},
+            }
+        )
+
+        self.assertEqual(mgr.sent_audio_messages_total("bot_123", "per_participant", "participant_a"), 2)
+        self.assertEqual(mgr.sent_audio_messages_total("bot_123", "per_participant", "participant_b"), 1)
+
+    def test_sent_audio_messages_metric_ignores_non_audio_messages(self, MockClient):
+        """Test that video and other websocket messages do not increment the audio metric."""
+        mgr = BotWebsocketClientManager(
+            mixed_audio_url=MIXED_URL,
+            per_participant_audio_url=None,
+            per_participant_video_url=None,
+            on_message_callback=self.mock_callback,
+        )
+
+        mgr._on_message_sent({"bot_id": "bot_123", "trigger": "realtime_video.per_participant", "data": {}})
+
+        self.assertEqual(mgr.sent_audio_messages_total("bot_123", "mixed"), 0)
+
+    def test_audio_send_failure_metric_logs_exception_details(self, MockClient):
+        """Test that websocket send failures are counted with exception details."""
+        mgr = BotWebsocketClientManager(
+            mixed_audio_url=MIXED_URL,
+            per_participant_audio_url=None,
+            per_participant_video_url=None,
+            on_message_callback=self.mock_callback,
+        )
+        message = {
+            "bot_id": "bot_123",
+            "trigger": "realtime_audio.mixed",
+            "data": {"sequence": 3},
+        }
+
+        with patch("bots.bot_controller.bot_websocket_client_manager.logger") as mock_logger:
+            mgr._on_message_send_failed(message, ConnectionError("send failed"))
+
+        self.assertEqual(mgr.audio_send_failures_total("bot_123", "mixed"), 1)
+        log_message = mock_logger.error.call_args.args[0]
+        self.assertIn("attendee_audio_send_failures_total", log_message)
+        self.assertIn("ConnectionError", log_message)
+        self.assertIn("send failed", log_message)
+
+    def test_audio_drop_metric_logs_connection_state(self, MockClient):
+        """Test that pre-send drops are counted with connection state."""
+        mgr = BotWebsocketClientManager(
+            mixed_audio_url=MIXED_URL,
+            per_participant_audio_url=None,
+            per_participant_video_url=None,
+            on_message_callback=self.mock_callback,
+        )
+        message = {
+            "bot_id": "bot_123",
+            "trigger": "realtime_audio.mixed",
+            "data": {"sequence": 4},
+        }
+
+        with patch("bots.bot_controller.bot_websocket_client_manager.logger") as mock_logger:
+            mgr._on_message_dropped(message, "CONNECTING")
+
+        self.assertEqual(mgr.audio_dropped_messages_total("bot_123", "mixed"), 1)
+        log_message = mock_logger.warning.call_args.args[0]
+        self.assertIn("attendee_audio_dropped_messages_total", log_message)
+        self.assertIn("CONNECTING", log_message)
 
     # --------------------------------------------------------------------- #
     #  Purpose tracking tests                                               #
