@@ -5,6 +5,8 @@ import hashlib
 import json
 import logging
 import os
+import signal
+import subprocess
 import threading
 import time
 from time import sleep
@@ -15,6 +17,7 @@ import requests
 from django.conf import settings
 from pyvirtualdisplay import Display
 from selenium import webdriver
+from selenium.common.exceptions import WebDriverException
 from selenium.webdriver.chrome.service import Service
 from websockets.sync.server import serve
 
@@ -29,6 +32,18 @@ from .debug_screen_recorder import DebugScreenRecorder
 from .ui_methods import UiAuthorizedUserNotInMeetingTimeoutExceededException, UiBlockedByCaptchaException, UiCouldNotJoinMeetingWaitingForHostException, UiCouldNotJoinMeetingWaitingRoomTimeoutException, UiIncorrectPasswordException, UiInfinitelyRetryableException, UiLoginAttemptFailedException, UiLoginRequiredException, UiMeetingNotFoundException, UiRequestToJoinDeniedException, UiRetryableException, UiRetryableExpectedException
 
 logger = logging.getLogger(__name__)
+
+DEBUG_ARTIFACT_CAPTURE_TIMEOUT_SECONDS = int(os.getenv("DEBUG_ARTIFACT_CAPTURE_TIMEOUT_SECONDS", 5))
+CHROMEDRIVER_UNHEALTHY_MESSAGE_MARKERS = (
+    "chrome not reachable",
+    "tab crashed",
+    "read timed out",
+    "devtoolsactiveport file doesn't exist",
+    "invalid session id",
+    "session deleted",
+    "disconnected",
+    "timed out receiving message from renderer",
+)
 
 
 class WebBotAdapter(BotAdapter):
@@ -83,6 +98,7 @@ class WebBotAdapter(BotAdapter):
         self.video_frame_size = video_frame_size
 
         self.driver = None
+        self.webdriver_unhealthy = False
 
         self.send_frames = True
 
@@ -477,25 +493,124 @@ class WebBotAdapter(BotAdapter):
     def send_login_required_message(self):
         self.send_message_callback({"message": self.Messages.LOGIN_REQUIRED})
 
+    def exception_indicates_unhealthy_chromedriver(self, exception):
+        if exception is None:
+            return False
+
+        if isinstance(exception, TimeoutError):
+            return True
+
+        exception_text = str(exception).lower()
+        if isinstance(exception, WebDriverException) and any(marker in exception_text for marker in CHROMEDRIVER_UNHEALTHY_MESSAGE_MARKERS):
+            return True
+
+        if any(marker in exception_text for marker in CHROMEDRIVER_UNHEALTHY_MESSAGE_MARKERS):
+            return True
+
+        inner_exception = getattr(exception, "inner_exception", None)
+        if inner_exception is not None and inner_exception is not exception:
+            return self.exception_indicates_unhealthy_chromedriver(inner_exception)
+
+        return False
+
+    def mark_webdriver_unhealthy(self, reason, exception=None):
+        if self.webdriver_unhealthy:
+            return
+
+        self.webdriver_unhealthy = True
+        logger.warning(
+            "Marking ChromeDriver unhealthy. reason=%s exception_type=%s exception=%s",
+            reason,
+            exception.__class__.__name__ if exception else "not_available",
+            exception,
+        )
+        self.kill_browser_processes()
+
+    def kill_process_tree(self, pid):
+        try:
+            child_pids = subprocess.check_output(["pgrep", "-P", str(pid)], text=True).split()
+        except subprocess.CalledProcessError:
+            child_pids = []
+        except Exception as e:
+            logger.warning("Failed to list child processes for pid %s: %s", pid, e)
+            child_pids = []
+
+        for child_pid in child_pids:
+            self.kill_process_tree(int(child_pid))
+
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.kill(pid, sig)
+                if sig == signal.SIGTERM:
+                    time.sleep(0.2)
+            except ProcessLookupError:
+                return
+            except Exception as e:
+                logger.warning("Failed to send signal %s to pid %s: %s", sig, pid, e)
+                return
+
+    def kill_browser_processes(self):
+        driver_process = getattr(getattr(self.driver, "service", None), "process", None)
+        driver_pid = getattr(driver_process, "pid", None)
+        if driver_pid:
+            logger.warning("Killing ChromeDriver process tree pid=%s", driver_pid)
+            self.kill_process_tree(driver_pid)
+            return
+
+        logger.warning("ChromeDriver pid unavailable; killing local chrome/chromedriver processes")
+        for pattern in ("chromedriver", "chrome", "chromium"):
+            try:
+                subprocess.run(["pkill", "-TERM", "-f", pattern], check=False, timeout=2)
+            except Exception as e:
+                logger.warning("Failed to terminate processes matching %s: %s", pattern, e)
+
+    def run_driver_call_with_timeout(self, description, callback):
+        if self.webdriver_unhealthy:
+            logger.warning("Skipping %s because ChromeDriver is already marked unhealthy", description)
+            return None
+
+        result = {}
+
+        def run_callback():
+            try:
+                result["value"] = callback()
+            except Exception as e:
+                result["exception"] = e
+
+        thread = threading.Thread(target=run_callback, daemon=True)
+        thread.start()
+        thread.join(DEBUG_ARTIFACT_CAPTURE_TIMEOUT_SECONDS)
+
+        if thread.is_alive():
+            self.mark_webdriver_unhealthy(f"{description}_timeout")
+            logger.warning("%s timed out after %s seconds", description, DEBUG_ARTIFACT_CAPTURE_TIMEOUT_SECONDS)
+            return None
+
+        if "exception" in result:
+            exception = result["exception"]
+            if self.exception_indicates_unhealthy_chromedriver(exception):
+                self.mark_webdriver_unhealthy(f"{description}_failed", exception)
+            logger.warning("Error during %s: %s", description, exception)
+            return None
+
+        return result.get("value")
+
     def capture_screenshot_and_mhtml_file(self):
         # Take a screenshot and mhtml file of the page, because it is helpful to have for debugging
         current_time = datetime.datetime.now()
         timestamp = current_time.strftime("%Y%m%d_%H%M%S")
         screenshot_path = f"/tmp/ui_element_not_found_{timestamp}.png"
-        try:
-            self.driver.save_screenshot(screenshot_path)
-        except Exception as e:
-            logger.warning(f"Error saving screenshot: {e}")
+        screenshot_saved = self.run_driver_call_with_timeout("save_debug_screenshot", lambda: self.driver.save_screenshot(screenshot_path))
+        if not screenshot_saved:
             screenshot_path = None
 
         mhtml_file_path = f"/tmp/page_snapshot_{timestamp}.mhtml"
-        try:
-            result = self.driver.execute_cdp_cmd("Page.captureSnapshot", {})
+        result = self.run_driver_call_with_timeout("save_debug_mhtml", lambda: self.driver.execute_cdp_cmd("Page.captureSnapshot", {}))
+        if result:
             mhtml_bytes = result["data"]  # Extract the data from the response dictionary
             with open(mhtml_file_path, "w", encoding="utf-8") as f:
                 f.write(mhtml_bytes)
-        except Exception as e:
-            logger.warning(f"Error saving mhtml: {e}")
+        else:
             mhtml_file_path = None
 
         return screenshot_path, mhtml_file_path, current_time
@@ -522,24 +637,10 @@ class WebBotAdapter(BotAdapter):
         )
 
     def send_debug_screenshot_message(self, step, exception, inner_exception):
-        current_time = datetime.datetime.now()
-        timestamp = current_time.strftime("%Y%m%d_%H%M%S")
-        screenshot_path = f"/tmp/ui_element_not_found_{timestamp}.png"
-        try:
-            self.driver.save_screenshot(screenshot_path)
-        except Exception as e:
-            logger.warning(f"Error saving screenshot: {e}")
-            screenshot_path = None
+        if self.exception_indicates_unhealthy_chromedriver(exception) or self.exception_indicates_unhealthy_chromedriver(inner_exception):
+            self.mark_webdriver_unhealthy("join_failure_exception", exception or inner_exception)
 
-        mhtml_file_path = f"/tmp/page_snapshot_{timestamp}.mhtml"
-        try:
-            result = self.driver.execute_cdp_cmd("Page.captureSnapshot", {})
-            mhtml_bytes = result["data"]  # Extract the data from the response dictionary
-            with open(mhtml_file_path, "w", encoding="utf-8") as f:
-                f.write(mhtml_bytes)
-        except Exception as e:
-            logger.warning(f"Error saving mhtml: {e}")
-            mhtml_file_path = None
+        screenshot_path, mhtml_file_path, current_time = self.capture_screenshot_and_mhtml_file()
 
         self.send_message_callback(
             {
@@ -548,6 +649,7 @@ class WebBotAdapter(BotAdapter):
                 "current_time": current_time,
                 "mhtml_file_path": mhtml_file_path,
                 "screenshot_path": screenshot_path,
+                "webdriver_unhealthy": self.webdriver_unhealthy,
                 "exception_type": exception.__class__.__name__ if exception else "exception_not_available",
                 "exception_message": exception.__str__() if exception else "exception_message_not_available",
                 "inner_exception_type": inner_exception.__class__.__name__ if inner_exception else "inner_exception_not_available",
@@ -750,6 +852,11 @@ class WebBotAdapter(BotAdapter):
                 logger.warning(f"Failed to join meeting and the {e.__class__.__name__} exception is infinitely retryable so retrying")
 
             except UiRetryableExpectedException as e:
+                if self.exception_indicates_unhealthy_chromedriver(e):
+                    logger.warning("ChromeDriver became unhealthy while joining; failing bot instead of retrying")
+                    self.send_debug_screenshot_message(step=e.step, exception=e, inner_exception=e.inner_exception)
+                    return
+
                 if num_retries >= max_retries:
                     logger.info(f"Failed to join meeting and the {e.__class__.__name__} exception is retryable but the number of retries exceeded the limit and there were {num_expected_exceptions} expected exceptions, so returning")
                     self.send_debug_screenshot_message(step=e.step, exception=e, inner_exception=e.inner_exception)
@@ -766,6 +873,11 @@ class WebBotAdapter(BotAdapter):
                     logger.info(f"Failed to join meeting and the {e.__class__.__name__} exception is expected so not incrementing num_retries, but {num_expected_exceptions} expected exceptions have occurred")
 
             except UiRetryableException as e:
+                if self.exception_indicates_unhealthy_chromedriver(e):
+                    logger.warning("ChromeDriver became unhealthy while joining; failing bot instead of retrying")
+                    self.send_debug_screenshot_message(step=e.step, exception=e, inner_exception=e.inner_exception)
+                    return
+
                 if num_retries >= max_retries:
                     logger.info(f"Failed to join meeting and the {e.__class__.__name__} exception is retryable but the number of retries exceeded the limit, so returning")
                     self.send_debug_screenshot_message(step=e.step, exception=e, inner_exception=e.inner_exception)
@@ -779,6 +891,11 @@ class WebBotAdapter(BotAdapter):
 
                 num_retries += 1
             except Exception as e:
+                if self.exception_indicates_unhealthy_chromedriver(e):
+                    logger.warning("ChromeDriver became unhealthy while joining; failing bot instead of retrying")
+                    self.send_debug_screenshot_message(step="webdriver_unhealthy", exception=e, inner_exception=None)
+                    return
+
                 if num_retries >= max_retries:
                     logger.exception(f"Failed to join meeting and the unexpected {e.__class__.__name__} exception with message {e.__str__()} is retryable but the number of retries exceeded the limit, so returning.")
                     self.send_debug_screenshot_message(step="unknown", exception=e, inner_exception=None)
@@ -834,15 +951,21 @@ class WebBotAdapter(BotAdapter):
         if self.stop_recording_screen_callback:
             self.stop_recording_screen_callback()
 
+        if self.webdriver_unhealthy:
+            logger.warning("Skipping graceful meeting leave because ChromeDriver is unhealthy")
+            self.kill_browser_processes()
+            self.left_meeting = True
+            return
+
         # Save a screenshot and mhtml file of the page right before the bot leaves the meeting
         screenshot_path_right_before_leave = None
         mhtml_file_path_right_before_leave = None
         try:
             logger.info("disable media sending")
-            self.driver.execute_script("window.ws?.disableMediaSending();")
+            self.run_driver_call_with_timeout("disable_media_sending_before_leave", lambda: self.driver.execute_script("window.ws?.disableMediaSending();"))
 
             screenshot_path_right_before_leave, mhtml_file_path_right_before_leave, _ = self.capture_screenshot_and_mhtml_file()
-            self.click_leave_button()
+            self.run_driver_call_with_timeout("click_leave_button", self.click_leave_button)
         except Exception as e:
             logger.warning(f"Error during leave: {e}")
         finally:
@@ -856,20 +979,22 @@ class WebBotAdapter(BotAdapter):
             self.left_meeting = True
 
     def abort_join_attempt(self):
-        try:
-            self.driver.close()
-        except Exception as e:
-            logger.warning(f"Error closing driver: {e}")
+        if self.webdriver_unhealthy:
+            self.kill_browser_processes()
+            return
+
+        self.run_driver_call_with_timeout("close_driver_after_join_abort", self.driver.close)
 
     def cleanup(self):
         if self.stop_recording_screen_callback:
             self.stop_recording_screen_callback()
 
-        try:
+        if self.webdriver_unhealthy:
+            logger.warning("Skipping graceful ChromeDriver cleanup because ChromeDriver is unhealthy")
+            self.kill_browser_processes()
+        elif self.driver:
             logger.info("disable media sending")
-            self.driver.execute_script("window.ws?.disableMediaSending();")
-        except Exception as e:
-            logger.warning(f"Error during media sending disable: {e}")
+            self.run_driver_call_with_timeout("disable_media_sending_during_cleanup", lambda: self.driver.execute_script("window.ws?.disableMediaSending();"))
 
         # Wait for websocket buffers to be processed
         if self.last_websocket_message_processed_time:
@@ -878,24 +1003,16 @@ class WebBotAdapter(BotAdapter):
                 logger.info(f"Waiting until it's 2 seconds since last websockets message was processed or 30 seconds have passed. Currently it is {time.time() - self.last_websocket_message_processed_time} seconds and {time.time() - time_when_shutdown_initiated} seconds have passed")
                 sleep(0.5)
 
-        try:
+        if self.driver and not self.webdriver_unhealthy:
             if self.driver:
-                self.log_browser_history()
+                self.run_driver_call_with_timeout("log_browser_history", self.log_browser_history)
 
                 # Simulate closing browser window
-                try:
-                    self.subclass_specific_before_driver_close()
-                    self.driver.close()
-                except Exception as e:
-                    logger.warning(f"Error closing driver: {e}")
+                self.run_driver_call_with_timeout("before_driver_close", self.subclass_specific_before_driver_close)
+                self.run_driver_call_with_timeout("close_driver", self.driver.close)
 
                 # Then quit the driver
-                try:
-                    self.driver.quit()
-                except Exception as e:
-                    logger.warning(f"Error quitting driver: {e}")
-        except Exception as e:
-            logger.warning(f"Error during cleanup: {e}")
+                self.run_driver_call_with_timeout("quit_driver", self.driver.quit)
 
         if self.debug_screen_recorder:
             self.debug_screen_recorder.stop()

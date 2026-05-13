@@ -1828,6 +1828,7 @@ class BotController:
                     "current_time": message.get("current_time").isoformat(),
                     "exception_type": message.get("exception_type"),
                     "inner_exception_type": message.get("inner_exception_type"),
+                    "webdriver_unhealthy": message.get("webdriver_unhealthy", False),
                 },
             )
 
