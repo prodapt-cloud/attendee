@@ -1,10 +1,20 @@
 import json
 import logging
 import os
+from datetime import timedelta
 
+from django.utils import timezone
 from bots.models import BotEventManager, BotEventSubTypes, BotEventTypes
 
 logger = logging.getLogger(__name__)
+
+
+def run_bot_task_expiry_seconds():
+    return int(os.getenv("RUN_BOT_TASK_EXPIRY_SECONDS", 900))
+
+
+def run_bot_task_expires_at(bot):
+    return (bot.join_at or bot.created_at or timezone.now()) + timedelta(seconds=run_bot_task_expiry_seconds())
 
 
 def launch_bot(bot):
@@ -48,4 +58,12 @@ def launch_bot(bot):
         # Default to launching bot via celery
         from .tasks.run_bot_task import run_bot
 
-        run_bot.delay(bot.id)
+        expires_at = run_bot_task_expires_at(bot)
+        run_bot.apply_async(args=[bot.id])
+        logger.info(
+            "Bot %s (%s) launched via celery run_bot task with expires_at=%s expiry_seconds=%s",
+            bot.object_id,
+            bot.id,
+            expires_at.isoformat(),
+            run_bot_task_expiry_seconds(),
+        )

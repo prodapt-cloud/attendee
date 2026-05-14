@@ -3,25 +3,77 @@ import os
 import signal
 import subprocess
 import time
+from datetime import timedelta
 
 from celery import shared_task
 from celery.signals import worker_shutting_down
 from celery.exceptions import SoftTimeLimitExceeded
+from django.utils import timezone
 
 from bots.bot_controller import BotController
-from bots.models import Bot, BotEventManager, BotEventSubTypes, BotEventTypes
+from bots.models import Bot, BotEventManager, BotEventSubTypes, BotEventTypes, BotStates
 
 logger = logging.getLogger(__name__)
 
 
 RUN_BOT_SOFT_TIME_LIMIT_SECONDS = int(os.getenv("RUN_BOT_SOFT_TIME_LIMIT_SECONDS", 3600))
 RUN_BOT_HARD_TIME_LIMIT_SECONDS = int(os.getenv("RUN_BOT_HARD_TIME_LIMIT_SECONDS", 3660))
+RUN_BOT_TASK_EXPIRY_SECONDS = int(os.getenv("RUN_BOT_TASK_EXPIRY_SECONDS", 900))
+
+
+def bot_launch_reference_time(bot):
+    return bot.join_at or bot.created_at
+
+
+def bot_task_is_stale(bot):
+    reference_time = bot_launch_reference_time(bot)
+    if reference_time is None:
+        return False
+
+    return timezone.now() > reference_time + timedelta(seconds=RUN_BOT_TASK_EXPIRY_SECONDS)
+
+
+def emit_stale_run_bot_task_metric(bot, task_id, age_seconds):
+    logger.warning(
+        "attendee_stale_run_bot_tasks_total bot_id=%s bot_object_id=%s task_id=%s state=%s age_seconds=%s expiry_seconds=%s",
+        bot.id,
+        bot.object_id,
+        task_id,
+        bot.state,
+        int(age_seconds),
+        RUN_BOT_TASK_EXPIRY_SECONDS,
+    )
+
+
+def mark_stale_run_bot_task(bot, task_id):
+    reference_time = bot_launch_reference_time(bot)
+    age_seconds = (timezone.now() - reference_time).total_seconds() if reference_time else 0
+    emit_stale_run_bot_task_metric(bot, task_id, age_seconds)
+
+    if bot.state in [BotStates.JOINING, BotStates.STAGED, BotStates.SCHEDULED] and BotEventManager.event_can_be_created_for_state(BotEventTypes.FATAL_ERROR, bot.state):
+        BotEventManager.create_event(
+            bot=bot,
+            event_type=BotEventTypes.FATAL_ERROR,
+            event_sub_type=BotEventSubTypes.FATAL_ERROR_BOT_NOT_LAUNCHED,
+            event_metadata={
+                "reason": "stale_run_bot_task",
+                "task_id": task_id,
+                "age_seconds": int(age_seconds),
+                "expiry_seconds": RUN_BOT_TASK_EXPIRY_SECONDS,
+            },
+        )
 
 
 @shared_task(bind=True, soft_time_limit=RUN_BOT_SOFT_TIME_LIMIT_SECONDS, time_limit=RUN_BOT_HARD_TIME_LIMIT_SECONDS)
 def run_bot(self, bot_id):
     logger.info(f"Running bot {bot_id}")
     try:
+        bot = Bot.objects.get(id=bot_id)
+        if bot_task_is_stale(bot):
+            mark_stale_run_bot_task(bot, self.request.id)
+            logger.warning("Skipping stale run_bot task for bot %s task_id=%s", bot_id, self.request.id)
+            return
+
         bot_controller = BotController(bot_id)
         bot_controller.run()
     except SoftTimeLimitExceeded:
