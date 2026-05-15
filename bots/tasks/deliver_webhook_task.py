@@ -102,9 +102,22 @@ def deliver_webhook(self, delivery_id):
         "data": delivery.payload,
     }
 
-    # Sign the payload
+    # Sign the payload. Some self-hosted deployments may have a legacy
+    # WebhookSecret row whose encrypted secret is missing or undecryptable after
+    # fixing CREDENTIALS_ENCRYPTION_KEY. Repair it instead of dropping delivery.
     active_secret = subscription.project.webhook_secrets.filter().order_by("-created_at").first()
-    signature = sign_payload(webhook_data, active_secret.get_secret())
+    secret = active_secret.get_secret() if active_secret else None
+    if secret is None:
+        logger.warning(
+            "Webhook secret missing or unreadable; creating replacement secret for project %s before delivery %s",
+            subscription.project.object_id,
+            delivery.id,
+        )
+        active_secret = subscription.project.webhook_secrets.create()
+        secret = active_secret.get_secret()
+    if secret is None:
+        raise ValueError(f"Webhook secret could not be created for delivery {delivery.id}")
+    signature = sign_payload(webhook_data, secret)
 
     # Check if the global webhook rate limit has been reached before delivering.
     if is_global_webhook_rate_limit_reached():
@@ -126,6 +139,13 @@ def deliver_webhook(self, delivery_id):
 
     # Send the webhook
     try:
+        logger.info(
+            "Delivering webhook %s trigger=%s bot=%s url=%s",
+            delivery.id,
+            WebhookTriggerTypes.trigger_type_to_api_code(delivery.webhook_trigger_type),
+            delivery.bot.object_id if delivery.bot else None,
+            subscription.url,
+        )
         response = requests.post(
             subscription.url,
             json=webhook_data,
